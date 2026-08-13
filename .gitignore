@@ -1,0 +1,11 @@
+# Build artifacts
+bin/
+obj/
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# Local
+*.local.json
