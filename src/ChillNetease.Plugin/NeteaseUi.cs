@@ -648,6 +648,9 @@ namespace ChillNetease.Plugin
 
         private static void HandleClick(Vector2 p)
         {
+            // 点击必须落在面板内部（黑框外点击一律不响应）
+            if (!WindowRect.Contains(p)) return;
+
             // 隐藏按钮（右上角）
             if (p.x >= WindowRect.x + WindowRect.width - 72 && p.x <= WindowRect.x + WindowRect.width - 12 &&
                 p.y >= WindowRect.y + 8 && p.y <= WindowRect.y + 34)

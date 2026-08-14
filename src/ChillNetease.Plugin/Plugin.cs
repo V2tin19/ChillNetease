@@ -20,7 +20,7 @@ namespace ChillNetease.Plugin
     {
         public const string PluginGuid = "com.haikisha.chillnetease";
         public const string PluginName = "Chill Netease";
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "0.1.1";
 
         public static ManualLogSource StaticLogger;
 
