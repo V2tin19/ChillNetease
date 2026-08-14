@@ -9,3 +9,6 @@ obj/
 
 # Local
 *.local.json
+
+# Release staging
+.release/
