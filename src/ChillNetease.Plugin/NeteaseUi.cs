@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using QRCoder;
 using UnityEngine;
@@ -102,6 +103,7 @@ namespace ChillNetease.Plugin
         private static bool _keyCtrlVDown, _keyBackDown;
         private static bool _searchDirty;          // 搜索词已改动但未重新搜索（Enter 优先触发搜索而不是播放）
         private static string _pendingSearchQuery; // 本次搜索发起时的关键词（回填结果时判断是否过期）
+        private static bool _importingLink;         // 导入歌单模式（复用搜索视图：输入/粘贴歌单链接）
         private static float _viewSwitchTime = -1f; // 最近一次视图切换时间（防双击第二击误触新视图的行）
 
         // ---- 数据 ----
@@ -401,8 +403,12 @@ namespace ChillNetease.Plugin
             }
             else if (_view == View.Search)
             {
+                if (_importingLink)
+                {
+                    DoImportLink(); // 导入模式：Enter 始终导入
+                }
                 // 词刚改过或没有结果 → Enter 是搜索；否则 Enter 是播放选中
-                if (_searchDirty || _searchResults.Count == 0)
+                else if (_searchDirty || _searchResults.Count == 0)
                 {
                     DoSearch();
                 }
@@ -428,6 +434,7 @@ namespace ChillNetease.Plugin
                 _view = View.Playlists;
                 _selected = 0;
                 _scrollOffset = 0;
+                _importingLink = false;
                 _viewSwitchTime = Time.unscaledTime;
             }
         }
@@ -510,8 +517,94 @@ namespace ChillNetease.Plugin
             _view = View.Search;
             _selected = 0;
             _scrollOffset = 0;
+            _importingLink = false;
             _searchDirty = false; // 新进入：输入为空，无脏状态
             _viewSwitchTime = Time.unscaledTime;
+        }
+
+        /// <summary>进入"导入歌单链接"模式（复用搜索视图的输入/粘贴基础，Enter 走导入）。</summary>
+        private static void EnterImportLink()
+        {
+            _view = View.Search;
+            _selected = 0;
+            _scrollOffset = 0;
+            _importingLink = true;
+            _searchDirty = false;
+            _searchQuery = "";
+            _searchResults.Clear();
+            _searchError = null;
+            _viewSwitchTime = Time.unscaledTime;
+        }
+
+        /// <summary>
+        /// 导入歌单链接：从粘贴内容中无感提取网易云歌单 URL → playlistId →
+        /// 后台拉取整单歌曲 → 注入游戏原生播放列表并播放 → 回到歌单视图。
+        /// 支持分享文案混排（"分享歌单: xxx https://music.163.com/m/playlist?id=..."）自动去噪。
+        /// </summary>
+        private static void DoImportLink()
+        {
+            var q = _searchQuery.Trim();
+            if (q.Length == 0 || Plugin.Bridge == null)
+            {
+                if (Plugin.Bridge == null) ShowToast("桥接未初始化");
+                return;
+            }
+            if (!TryExtractPlaylistId(q, out var playlistId))
+            {
+                ShowToast("未识别到歌单链接");
+                return;
+            }
+            if (_searchLoading) return;
+            _searchLoading = true;
+            _searchError = null;
+
+            Task.Run(() =>
+            {
+                try { return Plugin.Bridge.GetPlaylistSongs(playlistId, true); }
+                catch { return null; }
+            }).ContinueWith(t =>
+            {
+                _searchLoading = false;
+                var songs = t.Result;
+                if (songs == null || songs.Count == 0)
+                {
+                    _searchError = "导入失败（" + (Plugin.Bridge?.LastError() ?? "未知错误") + "）";
+                    return;
+                }
+
+                _currentPlaylistId = playlistId;
+                PlaylistLink.InjectedPlaylistId = playlistId;
+                PlaylistLink.InjectPlaylist(songs, 0);
+
+                // 回到歌单视图
+                _view = View.Playlists;
+                _selected = 0;
+                _scrollOffset = 0;
+                _importingLink = false;
+                _viewSwitchTime = Time.unscaledTime;
+                ShowToast($"已导入歌单（{songs.Count} 首）并开始播放");
+            });
+        }
+
+        /// <summary>
+        /// 从任意粘贴文本中提取网易云歌单 id（去噪）：
+        /// 优先 playlist?id=xxx，再兜底 music.163.com 链接里的 id，最后纯长数字。
+        /// </summary>
+        private static bool TryExtractPlaylistId(string text, out long playlistId)
+        {
+            playlistId = 0;
+            if (string.IsNullOrEmpty(text)) return false;
+
+            var m = Regex.Match(text, @"playlist\?id=(\d+)", RegexOptions.IgnoreCase);
+            if (!m.Success)
+            {
+                m = Regex.Match(text, @"music\.163\.com[^，。;\s]*?[?&]id=(\d+)", RegexOptions.IgnoreCase);
+            }
+            if (!m.Success)
+            {
+                m = Regex.Match(text, @"(?<!\d)\d{6,}(?!\d)"); // 兜底：纯长数字（歌单 id 一般 8 位以上）
+            }
+            return m.Success && long.TryParse(m.Groups[1].Value, out playlistId);
         }
 
         /// <summary>执行搜索（后台线程调 DLL，结果回填主线程）。</summary>
@@ -718,12 +811,22 @@ namespace ChillNetease.Plugin
                 return;
             }
 
-            // 搜索按钮（搜索视图，搜索框右侧）：点一下立即搜索
+            // 导入歌单按钮（歌单视图，右上角，搜索按钮左侧）
+            if (_view == View.Playlists &&
+                p.x >= WindowRect.x + WindowRect.width - 282 && p.x <= WindowRect.x + WindowRect.width - 222 &&
+                p.y >= WindowRect.y + 8 && p.y <= WindowRect.y + 34)
+            {
+                EnterImportLink();
+                return;
+            }
+
+            // 搜索按钮（搜索视图，搜索框右侧）：搜索模式=立即搜索；导入模式=立即导入
             if (_view == View.Search &&
                 p.x >= WindowRect.x + WindowRect.width - 78 && p.x <= WindowRect.x + WindowRect.width - 12 &&
                 p.y >= WindowRect.y + HeaderH + 4 && p.y <= WindowRect.y + HeaderH + 30)
             {
-                DoSearch();
+                if (_importingLink) DoImportLink();
+                else DoSearch();
                 return;
             }
 
@@ -855,6 +958,7 @@ namespace ChillNetease.Plugin
             if (_view == View.Playlists)
             {
                 GUI.Box(new Rect(WindowRect.x + WindowRect.width - 212, WindowRect.y + 8, 60, 26), "搜索", btnStyle);
+                GUI.Box(new Rect(WindowRect.x + WindowRect.width - 282, WindowRect.y + 8, 60, 26), "导入", btnStyle);
             }
 
             // 返回按钮（Songs / Search 视图）
@@ -971,14 +1075,17 @@ namespace ChillNetease.Plugin
             // 搜索按钮（点击立即搜索；Enter 也智能触发，双保险）
             var btnStyle = new GUIStyle(GUI.skin.button) { fontSize = 13, alignment = TextAnchor.MiddleCenter };
             btnStyle.normal.textColor = new Color(0.95f, 0.9f, 0.8f);
-            if (GUI.Button(new Rect(boxX + boxW + 6, WindowRect.y + HeaderH + 4, 66, 26), "搜索", btnStyle))
+            if (GUI.Button(new Rect(boxX + boxW + 6, WindowRect.y + HeaderH + 4, 66, 26), _importingLink ? "导入" : "搜索", btnStyle))
             {
-                DoSearch();
+                if (_importingLink) DoImportLink();
+                else DoSearch();
             }
 
             _smallStyle.normal.textColor = new Color(0.6f, 0.6f, 0.6f);
             GUI.Label(new Rect(WindowRect.x + 12, WindowRect.y + HeaderH + 36, WindowRect.width - 24, 18),
-                "输入后 Enter 搜索 · ↑↓ 选歌 Enter 播放 · ← 返回", _smallStyle);
+                _importingLink
+                    ? "粘贴网易云歌单链接后 Enter 导入 · ← 返回"
+                    : "输入后 Enter 搜索 · ↑↓ 选歌 Enter 播放 · ← 返回", _smallStyle);
 
             // 结果列表
             float top = WindowRect.y + HeaderH + 58;
