@@ -110,6 +110,9 @@ namespace ChillNetease.Plugin
         private static List<SongInfo> _songs = new List<SongInfo>();
         private static bool _songsLoading;
         private static long _currentPlaylistId;
+        /// <summary>漫游FM 会话标记（非真实歌单 id，用于区分"当前播放列表来自 FM"）。</summary>
+        private const long FmPlaylistId = -1000;
+        private static bool _fmLoading;
         private static string _songsLoadError;
         private static readonly HashSet<long> _likedIds = new HashSet<long>();
         private static string _toast = "";
@@ -363,7 +366,7 @@ namespace ChillNetease.Plugin
             if (_view == View.Playlists)
             {
                 var list = _showMine ? _mine : _collected;
-                return list.Count;
+                return list.Count + 1; // +1 = 置顶固定项"漫游FM"
             }
             if (_view == View.Songs) return _songs.Count;
             if (_view == View.Search) return _searchResults.Count;
@@ -431,10 +434,50 @@ namespace ChillNetease.Plugin
 
         private static void OpenSelectedPlaylist()
         {
+            if (_selected == 0)
+            {
+                StartFM(); // 置顶固定项：漫游FM
+                return;
+            }
             var list = _showMine ? _mine : _collected;
-            if (_selected < 0 || _selected >= list.Count) return;
-            var pl = list[_selected];
+            int real = _selected - 1; // 逻辑行 0 是 FM，歌单从行 1 起
+            if (real < 0 || real >= list.Count) return;
+            var pl = list[real];
             LoadSongs(pl.Id);
+        }
+
+        /// <summary>
+        /// 漫游FM：拉取网易云私人 FM 推荐注入游戏原生播放列表并播放（走游戏原生播放器）。
+        /// 切歌由 PlaylistLink 接管（列表内循环）；FM 会话用 FmPlaylistId 标记。
+        /// </summary>
+        private static void StartFM()
+        {
+            if (Plugin.Bridge == null || !Plugin.Bridge.IsLoggedIn)
+            {
+                ShowToast("请先登录网易云账号");
+                return;
+            }
+            if (_fmLoading) return;
+            _fmLoading = true;
+            ShowToast("漫游FM 加载中…");
+            Task.Run(() =>
+            {
+                try { return Plugin.Bridge.GetPersonalFM(); }
+                catch { return null; }
+            }).ContinueWith(t =>
+            {
+                _fmLoading = false;
+                var songs = t.Result;
+                if (songs == null || songs.Count == 0)
+                {
+                    ShowToast("漫游FM 获取失败（" + (Plugin.Bridge?.LastError() ?? "未知错误") + "）");
+                    return;
+                }
+                _currentPlaylistId = FmPlaylistId;
+                PlaylistLink.InjectedPlaylistId = FmPlaylistId;
+                PlaylistLink.InjectPlaylist(songs, 0);
+                ShowToast($"漫游FM 已启动（{songs.Count} 首推荐）");
+            });
         }
 
         private static void PlaySelectedSong()
@@ -894,11 +937,18 @@ namespace ChillNetease.Plugin
                 int visible = VisibleLines();
                 for (int i = 0; i < visible; i++)
                 {
-                    int idx = _scrollOffset + i;
+                    int logical = _scrollOffset + i;
+                    var rect = new Rect(WindowRect.x + 8, top + i * LineH, WindowRect.width - 16, LineH - 3);
+                    if (logical == 0)
+                    {
+                        // 置顶固定项：漫游FM（个人 FM 推荐）
+                        DrawRow(rect, logical, "★ 漫游FM  [私人FM推荐]", true);
+                        continue;
+                    }
+                    int idx = logical - 1;
                     if (idx >= list.Count) break;
                     var pl = list[idx];
-                    var rect = new Rect(WindowRect.x + 8, top + i * LineH, WindowRect.width - 16, LineH - 3);
-                    DrawRow(rect, idx, $"{pl.Name}  [{pl.SongCount}首]", pl.CoverUrl != null);
+                    DrawRow(rect, logical, $"{pl.Name}  [{pl.SongCount}首]", pl.CoverUrl != null);
                 }
             }
         }

@@ -242,6 +242,15 @@ namespace ChillNetease.Plugin
             catch { return null; }
         }
 
+        /// <summary>个人 FM 推荐歌曲（go-musicfox PersonalFmService，返回与歌单同格式的歌曲列表）。</summary>
+        public List<SongInfo> GetPersonalFM()
+        {
+            var json = TakeString(NeteaseGetPersonalFM());
+            if (json == null) return null;
+            try { return JsonConvert.DeserializeObject<List<SongInfo>>(json); }
+            catch { return null; }
+        }
+
         /// <summary>收藏/取消收藏。like=true 收藏。</summary>
         public bool SetLike(long songId, bool like)
         {
