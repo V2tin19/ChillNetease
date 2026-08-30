@@ -140,6 +140,8 @@ namespace ChillNetease.Plugin
         private static GUIStyle _smallStyle;
         private static GUIStyle _toastStyle;
         private static GUIStyle _titleStyle;
+        private static GUIStyle _tabNormal;      // 分组标签：未选中（扁平深色）
+        private static GUIStyle _tabSelected;    // 分组标签：选中（暖黄高亮，与歌曲选中行统一）
         private static bool _stylesReady;
 
         private static void EnsureStyles()
@@ -163,6 +165,35 @@ namespace ChillNetease.Plugin
             _smallStyle = new GUIStyle(GUI.skin.label) { fontSize = 12 };
             _toastStyle = new GUIStyle(GUI.skin.label) { fontSize = 12 };
             _titleStyle = new GUIStyle(GUI.skin.label) { fontSize = 17, fontStyle = FontStyle.Bold };
+
+            // 分组标签：用纯色背景替换默认按钮皮肤（默认的灰渐变太重），选中态与歌曲选中行同色系
+            _tabNormal = new GUIStyle(GUI.skin.button)
+            {
+                fontSize = 12,
+                alignment = TextAnchor.MiddleCenter
+            };
+            _tabNormal.normal.background = MakeTex(new Color(0.13f, 0.13f, 0.15f, 0.85f));
+            _tabNormal.hover.background = MakeTex(new Color(0.19f, 0.19f, 0.22f, 0.9f));
+            _tabNormal.active.background = MakeTex(new Color(0.24f, 0.24f, 0.27f, 0.9f));
+            _tabNormal.focused.background = MakeTex(new Color(0.13f, 0.13f, 0.15f, 0.85f));
+            _tabNormal.normal.textColor = new Color(0.78f, 0.78f, 0.8f);
+            _tabNormal.hover.textColor = new Color(0.92f, 0.92f, 0.94f);
+            _tabNormal.active.textColor = new Color(0.92f, 0.92f, 0.94f);
+            _tabNormal.focused.textColor = new Color(0.78f, 0.78f, 0.8f);
+
+            _tabSelected = new GUIStyle(GUI.skin.button)
+            {
+                fontSize = 12,
+                alignment = TextAnchor.MiddleCenter
+            };
+            _tabSelected.normal.background = MakeTex(new Color(0.30f, 0.24f, 0.06f, 0.95f));
+            _tabSelected.hover.background = MakeTex(new Color(0.34f, 0.28f, 0.08f, 0.95f));
+            _tabSelected.active.background = MakeTex(new Color(0.36f, 0.30f, 0.10f, 0.95f));
+            _tabSelected.focused.background = MakeTex(new Color(0.30f, 0.24f, 0.06f, 0.95f));
+            _tabSelected.normal.textColor = new Color(1f, 0.85f, 0.2f);
+            _tabSelected.hover.textColor = new Color(1f, 0.88f, 0.3f);
+            _tabSelected.active.textColor = new Color(1f, 0.88f, 0.3f);
+            _tabSelected.focused.textColor = new Color(1f, 0.85f, 0.2f);
             _stylesReady = true;
         }
 
@@ -954,7 +985,7 @@ namespace ChillNetease.Plugin
             }
 
             // 分组标签页（歌单视图，标题区下方）：我的 / 收藏 / 导入
-            if (_view == View.Playlists && p.y >= WindowRect.y + 48 && p.y <= WindowRect.y + 76)
+            if (_view == View.Playlists && p.y >= WindowRect.y + 52 && p.y <= WindowRect.y + 80)
             {
                 for (int i = 0; i <= (int)PlaylistGroup.Imported; i++)
                 {
@@ -1105,7 +1136,7 @@ namespace ChillNetease.Plugin
             GUI.Label(new Rect(WindowRect.x + 12, WindowRect.y + 8, 220, 24), "网易云音乐", _titleStyle);
 
             _smallStyle.normal.textColor = login ? new Color(0.2f, 0.8f, 0.4f) : new Color(0.9f, 0.3f, 0.3f);
-            GUI.Label(new Rect(WindowRect.x + 12, WindowRect.y + 36, 260, 20), $"{status} {nick}".Trim(), _smallStyle);
+            GUI.Label(new Rect(WindowRect.x + 12, WindowRect.y + 34, 260, 18), $"{status} {nick}".Trim(), _smallStyle);
 
             // 右上角按钮（点击走 Win32 鼠标区域，见 HandleClick）
             var btnStyle = new GUIStyle(GUI.skin.box)
@@ -1142,26 +1173,15 @@ namespace ChillNetease.Plugin
             else if (_view == View.Playlists)
             {
                 // 分组标签页：我的 / 收藏 / 导入（点击或按 → 切换；GUI.Button 与 Win32 区域双保险，均为幂等操作）
-                var tabStyle = new GUIStyle(GUI.skin.button) { fontSize = 12, alignment = TextAnchor.MiddleCenter };
                 string[] tabNames = { "我的", "收藏", "导入" };
                 for (int i = 0; i <= (int)PlaylistGroup.Imported; i++)
                 {
-                    var rect = new Rect(WindowRect.x + 8 + i * 58, WindowRect.y + 48, 54, 24);
-                    if (GUI.Button(rect, tabNames[i], tabStyle))
-                    {
-                        SetGroup((PlaylistGroup)i);
-                    }
-                    if (_group == (PlaylistGroup)i)
-                    {
-                        // 选中标签文字高亮（盖在按钮上）
-                        var selStyle = new GUIStyle(_smallStyle) { fontStyle = FontStyle.Bold };
-                        selStyle.normal.textColor = new Color(1f, 0.85f, 0.2f);
-                        selStyle.alignment = TextAnchor.MiddleCenter;
-                        GUI.Label(rect, tabNames[i], selStyle);
-                    }
+                    var rect = new Rect(WindowRect.x + 8 + i * 58, WindowRect.y + 54, 54, 24);
+                    var tabStyle = _group == (PlaylistGroup)i ? _tabSelected : _tabNormal;
+                    GUI.Button(rect, tabNames[i], tabStyle);
                 }
                 _smallStyle.normal.textColor = new Color(0.6f, 0.6f, 0.6f);
-                GUI.Label(new Rect(WindowRect.x + 184, WindowRect.y + 54, 250, 20),
+                GUI.Label(new Rect(WindowRect.x + 184, WindowRect.y + 58, 250, 20),
                     "→ 切换分组 · 导入的歌单可保留", _smallStyle);
             }
             else
