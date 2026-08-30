@@ -17,6 +17,9 @@ namespace ChillNetease.Plugin
     {
         private enum View { Login, Playlists, Songs, Search }
 
+        /// <summary>歌单视图的分组标签页。</summary>
+        private enum PlaylistGroup { Mine = 0, Collected = 1, Imported = 2 }
+
         // ---- Win32 ----
         private const int VK_F6 = 0x75;   // F6（F7/F9 被 Chill Env Sync、F8 被 ChillAI 占用）
         private const int VK_UP = 0x26;
@@ -24,6 +27,7 @@ namespace ChillNetease.Plugin
         private const int VK_RETURN = 0x0D;
         private const int VK_LEFT = 0x25;
         private const int VK_RIGHT = 0x27;
+        private const int VK_DELETE = 0x2E;
         private const int VK_LBUTTON = 0x01;
 
         [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
@@ -80,10 +84,10 @@ namespace ChillNetease.Plugin
         // ---- 状态 ----
         private static View _view = View.Playlists;
         private static bool _windowOpen;
-        private static bool _keyF7Down, _keyUpDown, _keyDownDown, _keyEnterDown, _keyLeftDown, _keyRightDown, _lmbDown;
+        private static bool _keyF7Down, _keyUpDown, _keyDownDown, _keyEnterDown, _keyLeftDown, _keyRightDown, _keyDeleteDown, _lmbDown;
         private static int _selected;
         private static int _scrollOffset;
-        private static bool _showMine = true;
+        private static PlaylistGroup _group = PlaylistGroup.Mine;
         private static IntPtr _gameHwnd;
         private static int _hwndFindFrame = -1;
 
@@ -109,9 +113,13 @@ namespace ChillNetease.Plugin
         // ---- 数据 ----
         private static List<PlaylistInfo> _mine = new List<PlaylistInfo>();
         private static List<PlaylistInfo> _collected = new List<PlaylistInfo>();
+        /// <summary>本地保存的"链接导入歌单"（PlaylistStore 快照，重启保留）。</summary>
+        private static List<StoredPlaylist> _imported = new List<StoredPlaylist>();
         private static List<SongInfo> _songs = new List<SongInfo>();
         private static bool _songsLoading;
         private static long _currentPlaylistId;
+        /// <summary>启动时是否已尝试恢复上次导入的歌单。</summary>
+        private static bool _restoreTried;
         /// <summary>漫游FM 会话标记（非真实歌单 id，用于区分"当前播放列表来自 FM"）。</summary>
         private const long FmPlaylistId = -1000;
         private static bool _fmLoading;
@@ -173,6 +181,8 @@ namespace ChillNetease.Plugin
             _windowOpen = !_windowOpen;
             if (_windowOpen)
             {
+                // 打开时刷新本地导入歌单快照（含其他处增删后的最新状态）
+                if (PlaylistStore.Loaded) _imported = PlaylistStore.Snapshot();
                 // 打开时按登录态决定视图：未登录 → 显示二维码登录
                 if (Plugin.Bridge != null && Plugin.Bridge.IsLoggedIn)
                 {
@@ -203,6 +213,8 @@ namespace ChillNetease.Plugin
             WindowRect.y = 10f;
 
             MusicImporter.Pump();
+            // 启动恢复：MusicService 捕获后，把上次导入的歌单重新注入游戏播放列表（不自动播放）
+            TryRestoreImported();
             // 登录二维码轮询（未登录视图）
             PollQrLogin();
             // 导入失败 → 面板提示（消费一次）
@@ -250,8 +262,21 @@ namespace ChillNetease.Plugin
             if (down && !_keyDownDown) MoveSelection(1);
             if (enter && !_keyEnterDown) Activate();
             if (left && !_keyLeftDown) GoBack();
-            if (right && !_keyRightDown) Activate();
+            if (right && !_keyRightDown)
+            {
+                if (_view == View.Playlists) CycleGroup(1); // 歌单视图：→ 切换分组标签页
+                else Activate();
+            }
             _keyUpDown = up; _keyDownDown = down; _keyEnterDown = enter; _keyLeftDown = left; _keyRightDown = right;
+
+            // Delete 键：歌单视图导入分组下删除选中的导入歌单
+            bool del = Key(VK_DELETE);
+            if (del && !_keyDeleteDown && _view == View.Playlists && _group == PlaylistGroup.Imported &&
+                _selected > 0 && _selected - 1 < _imported.Count)
+            {
+                DeleteImported(_imported[_selected - 1].Id);
+            }
+            _keyDeleteDown = del;
 
             // 搜索视图：文本输入（ASCII 键 + Ctrl+V 粘贴 + Backspace）
             if (_view == View.Search)
@@ -367,12 +392,19 @@ namespace ChillNetease.Plugin
         {
             if (_view == View.Playlists)
             {
-                var list = _showMine ? _mine : _collected;
-                return list.Count + 1; // +1 = 置顶固定项"漫游FM"
+                return GroupListCount() + 1; // +1 = 置顶固定项"漫游FM"
             }
             if (_view == View.Songs) return _songs.Count;
             if (_view == View.Search) return _searchResults.Count;
             return 0; // Login 视图无列表
+        }
+
+        /// <summary>当前分组的条目数。</summary>
+        private static int GroupListCount()
+        {
+            if (_group == PlaylistGroup.Imported) return _imported.Count;
+            var list = _group == PlaylistGroup.Mine ? _mine : _collected;
+            lock (_mine) return list.Count;
         }
 
         private static int VisibleLines()
@@ -439,6 +471,24 @@ namespace ChillNetease.Plugin
             }
         }
 
+        /// <summary>切换分组标签页（越界循环）。</summary>
+        private static void CycleGroup(int delta)
+        {
+            int g = (int)_group + delta;
+            if (g < 0) g = 2;
+            if (g > 2) g = 0;
+            SetGroup((PlaylistGroup)g);
+        }
+
+        private static void SetGroup(PlaylistGroup g)
+        {
+            if (_group == g) return;
+            _group = g;
+            _selected = 0;
+            _scrollOffset = 0;
+            _viewSwitchTime = Time.unscaledTime;
+        }
+
         private static void OpenSelectedPlaylist()
         {
             if (_selected == 0)
@@ -446,11 +496,77 @@ namespace ChillNetease.Plugin
                 StartFM(); // 置顶固定项：漫游FM
                 return;
             }
-            var list = _showMine ? _mine : _collected;
             int real = _selected - 1; // 逻辑行 0 是 FM，歌单从行 1 起
-            if (real < 0 || real >= list.Count) return;
-            var pl = list[real];
-            LoadSongs(pl.Id);
+            if (_group == PlaylistGroup.Imported)
+            {
+                if (real < 0 || real >= _imported.Count) return;
+                OpenStoredPlaylist(_imported[real]);
+                return;
+            }
+            var list = _group == PlaylistGroup.Mine ? _mine : _collected;
+            lock (_mine)
+            {
+                if (real < 0 || real >= list.Count) return;
+                var pl = list[real];
+                LoadSongs(pl.Id);
+            }
+        }
+
+        /// <summary>打开本地保存的导入歌单：直接读本地缓存的曲目元数据（无需联网重拉）。</summary>
+        private static void OpenStoredPlaylist(StoredPlaylist stored)
+        {
+            if (stored?.Songs == null || stored.Songs.Count == 0)
+            {
+                ShowToast("该歌单本地缓存为空，请重新导入");
+                return;
+            }
+            _currentPlaylistId = stored.Id;
+            _songsLoading = false;
+            _songsLoadError = null;
+            lock (_songs)
+            {
+                _songs.Clear();
+                _songs.AddRange(stored.Songs);
+            }
+            _selected = 0;
+            _scrollOffset = 0;
+            _view = View.Songs;
+            _viewSwitchTime = Time.unscaledTime;
+            PlaylistStore.Touch(stored.Id);
+        }
+
+        /// <summary>删除一个本地导入歌单（文件存档同步移除）。</summary>
+        private static void DeleteImported(long id)
+        {
+            var removed = _imported.Find(p => p.Id == id);
+            if (removed == null) return; // 已删除（重复触发防护）
+            PlaylistStore.Remove(id);
+            _imported = PlaylistStore.Snapshot();
+            // 若删的是当前注入的歌单：解除注入关联（正在播的歌继续播，之后重新打开会重新注入）
+            if (PlaylistLink.InjectedPlaylistId == id) PlaylistLink.InjectedPlaylistId = -1;
+            if (_selected >= _imported.Count + 1) _selected = Math.Max(0, _imported.Count);
+            ShowToast("已删除: " + Truncate(removed.Name ?? "导入歌单", 24));
+        }
+
+        /// <summary>
+        /// 启动恢复：MusicService 捕获后，把最近使用的导入歌单重新注入游戏播放列表（不自动播放）。
+        /// 由 Tick 每帧调用，成功/确定无恢复项后不再尝试。
+        /// </summary>
+        private static void TryRestoreImported()
+        {
+            if (_restoreTried) return;
+            if (!PlaylistStore.Loaded) return;
+            if (MusicServicePatches.CurrentInstance == null) return; // 等游戏音乐服务就绪
+
+            var latest = PlaylistStore.GetLatest();
+            _restoreTried = true;
+            if (latest?.Songs == null || latest.Songs.Count == 0) return;
+            _imported = PlaylistStore.Snapshot();
+
+            PlaylistLink.InjectPlaylist(latest.Songs, -1);
+            PlaylistLink.InjectedPlaylistId = latest.Id;
+            ShowToast($"已恢复歌单「{Truncate(latest.Name ?? "导入歌单", 14)}」（{latest.Songs.Count} 首，未播放）");
+            Plugin.LogInfo($"[Netease] 启动恢复导入歌单: {latest.Name}({latest.Id}) {latest.Songs.Count} 首");
         }
 
         /// <summary>
@@ -500,7 +616,11 @@ namespace ChillNetease.Plugin
             }
             else
             {
-                // 已注入：直接按索引播放（目标歌 AudioClip 未加载时自动按需加载后播放）
+                // 已注入：点播位置超出注入窗口时先扩窗，再按索引播放
+                if (_selected >= PlaylistLink.InjectedCount)
+                {
+                    PlaylistLink.TryExtendWindow(_selected + 1);
+                }
                 var service = MusicServicePatches.CurrentInstance;
                 if (service != null && service.CurrentPlayList != null && _selected < service.CurrentPlayList.Count)
                 {
@@ -572,17 +692,30 @@ namespace ChillNetease.Plugin
                     return;
                 }
 
+                // 取歌单名并保存到本地存档（重启后面板仍可见、可恢复注入）
+                string name = "歌单 " + playlistId;
+                try
+                {
+                    var detail = Plugin.Bridge.GetPlaylistDetail(playlistId);
+                    if (detail != null && !string.IsNullOrEmpty(detail.Name)) name = detail.Name;
+                }
+                catch { }
+                PlaylistStore.Upsert(playlistId, name, songs);
+                _imported = PlaylistStore.Snapshot();
+
                 _currentPlaylistId = playlistId;
                 PlaylistLink.InjectedPlaylistId = playlistId;
                 PlaylistLink.InjectPlaylist(songs, 0);
 
-                // 回到歌单视图
+                // 回到歌单视图（切到导入分组，让用户看到刚导入的歌单）
                 _view = View.Playlists;
+                _group = PlaylistGroup.Imported;
+                _imported = PlaylistStore.Snapshot();
                 _selected = 0;
                 _scrollOffset = 0;
                 _importingLink = false;
                 _viewSwitchTime = Time.unscaledTime;
-                ShowToast($"已导入歌单（{songs.Count} 首）并开始播放");
+                ShowToast($"已导入「{Truncate(name, 14)}」（{songs.Count} 首）并保存到本地");
             });
         }
 
@@ -820,6 +953,36 @@ namespace ChillNetease.Plugin
                 return;
             }
 
+            // 分组标签页（歌单视图，标题区下方）：我的 / 收藏 / 导入
+            if (_view == View.Playlists && p.y >= WindowRect.y + 48 && p.y <= WindowRect.y + 76)
+            {
+                for (int i = 0; i <= (int)PlaylistGroup.Imported; i++)
+                {
+                    float tx = WindowRect.x + 8 + i * 58;
+                    if (p.x >= tx && p.x <= tx + 54)
+                    {
+                        SetGroup((PlaylistGroup)i);
+                        return;
+                    }
+                }
+            }
+
+            // 导入歌单行的 ✕ 删除按钮（行右侧 40px 区域，仅限可见行内）
+            if (_view == View.Playlists && _group == PlaylistGroup.Imported &&
+                p.x >= WindowRect.x + WindowRect.width - 40 && p.x <= WindowRect.x + WindowRect.width - 8)
+            {
+                int rowD = (int)((p.y - (WindowRect.y + HeaderH)) / LineH);
+                if (rowD >= 0 && rowD < ListVisibleLines())
+                {
+                    int idxD = _scrollOffset + rowD;
+                    if (idxD > 0 && idxD - 1 < _imported.Count)
+                    {
+                        DeleteImported(_imported[idxD - 1].Id);
+                        return;
+                    }
+                }
+            }
+
             // 搜索按钮（搜索视图，搜索框右侧）：搜索模式=立即搜索；导入模式=立即导入
             if (_view == View.Search &&
                 p.x >= WindowRect.x + WindowRect.width - 78 && p.x <= WindowRect.x + WindowRect.width - 12 &&
@@ -853,8 +1016,9 @@ namespace ChillNetease.Plugin
                     }
                 }
             }
-            // 返回按钮（左上角小区域）
-            if (p.x >= WindowRect.x + 8 && p.x <= WindowRect.x + 56 && p.y >= WindowRect.y + 50 && p.y <= WindowRect.y + 76)
+            // 返回按钮（左上角小区域，仅 Songs / Search 视图有该按钮；歌单视图该区域是分组标签页）
+            if ((_view == View.Songs || _view == View.Search) &&
+                p.x >= WindowRect.x + 8 && p.x <= WindowRect.x + 56 && p.y >= WindowRect.y + 50 && p.y <= WindowRect.y + 76)
             {
                 GoBack();
             }
@@ -977,7 +1141,28 @@ namespace ChillNetease.Plugin
             }
             else if (_view == View.Playlists)
             {
-                GUI.Label(new Rect(WindowRect.x + 72, WindowRect.y + 56, 260, 20), "歌单（Enter 打开 · F6 关闭）", _smallStyle);
+                // 分组标签页：我的 / 收藏 / 导入（点击或按 → 切换；GUI.Button 与 Win32 区域双保险，均为幂等操作）
+                var tabStyle = new GUIStyle(GUI.skin.button) { fontSize = 12, alignment = TextAnchor.MiddleCenter };
+                string[] tabNames = { "我的", "收藏", "导入" };
+                for (int i = 0; i <= (int)PlaylistGroup.Imported; i++)
+                {
+                    var rect = new Rect(WindowRect.x + 8 + i * 58, WindowRect.y + 48, 54, 24);
+                    if (GUI.Button(rect, tabNames[i], tabStyle))
+                    {
+                        SetGroup((PlaylistGroup)i);
+                    }
+                    if (_group == (PlaylistGroup)i)
+                    {
+                        // 选中标签文字高亮（盖在按钮上）
+                        var selStyle = new GUIStyle(_smallStyle) { fontStyle = FontStyle.Bold };
+                        selStyle.normal.textColor = new Color(1f, 0.85f, 0.2f);
+                        selStyle.alignment = TextAnchor.MiddleCenter;
+                        GUI.Label(rect, tabNames[i], selStyle);
+                    }
+                }
+                _smallStyle.normal.textColor = new Color(0.6f, 0.6f, 0.6f);
+                GUI.Label(new Rect(WindowRect.x + 184, WindowRect.y + 54, 250, 20),
+                    "→ 切换分组 · 导入的歌单可保留", _smallStyle);
             }
             else
             {
@@ -1034,11 +1219,35 @@ namespace ChillNetease.Plugin
 
         private static void DrawPlaylists()
         {
+            float top = WindowRect.y + HeaderH;
+            int visible = VisibleLines();
+            if (_group == PlaylistGroup.Imported)
+            {
+                // 导入分组：本地保存的链接导入歌单（快照引用，遍历无需加锁）
+                for (int i = 0; i < visible; i++)
+                {
+                    int logical = _scrollOffset + i;
+                    var rect = new Rect(WindowRect.x + 8, top + i * LineH, WindowRect.width - 16, LineH - 3);
+                    if (logical == 0)
+                    {
+                        DrawRow(rect, logical, "★ 漫游FM  [私人FM推荐]", true);
+                        continue;
+                    }
+                    int idx = logical - 1;
+                    if (idx >= _imported.Count) break;
+                    var stored = _imported[idx];
+                    DrawRow(rect, logical, $"{stored.Name}  [{stored.SongCount}首]", true);
+                    // 行尾删除按钮
+                    var delStyle = _smallStyle;
+                    delStyle.normal.textColor = _selected == logical ? new Color(1f, 0.7f, 0.6f) : new Color(0.75f, 0.45f, 0.4f);
+                    GUI.Label(new Rect(rect.x + rect.width - 24, rect.y + 3, 22, 20), "✕", delStyle);
+                }
+                return;
+            }
+
             lock (_mine)
             {
-                var list = _showMine ? _mine : _collected;
-                float top = WindowRect.y + HeaderH;
-                int visible = VisibleLines();
+                var list = _group == PlaylistGroup.Mine ? _mine : _collected;
                 for (int i = 0; i < visible; i++)
                 {
                     int logical = _scrollOffset + i;

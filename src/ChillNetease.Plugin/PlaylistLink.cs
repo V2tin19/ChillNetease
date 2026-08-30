@@ -20,6 +20,13 @@ namespace ChillNetease.Plugin
     ///    游戏原生选歌列表立即显示网易云歌单，切歌键指向它。
     /// 2. 游戏内点歌/切歌走到播放入口时，若目标网易云歌 AudioClip 为空，
     ///    拦截 → 流式加载 AudioClip → 填回该曲目对象 → 继续播放（AudioClip 就绪后放行）。
+    ///
+    /// 大歌单保护（用户反馈数千首歌掉帧）：
+    /// - 注入用 ObservableList.AddRange 一次性填充（游戏自己的标签筛选重建就是这么做的），
+    ///   避免 Clear+逐首 Add 产生数千次集合变更事件。
+    /// - 游戏播放列表只注入前 MaxInjectedSongs 首（注入窗口），其余曲目保留在 _fullSongs；
+    ///   播放/切歌接近窗口末尾时自动扩窗（TryExtendWindow），随机模式直接在全量歌单中随机。
+    ///   这样游戏侧任何随列表规模增长的开销都有上限，而面板里仍能浏览/点播全部歌曲。
     /// </summary>
     public static class PlaylistLink
     {
@@ -38,8 +45,23 @@ namespace ChillNetease.Plugin
         /// </summary>
         public static int LastPlayedIndex = -1;
 
+        /// <summary>当前注入歌单的完整曲目（游戏播放列表只注入前窗口数量，其余按需扩窗）。</summary>
+        private static List<SongInfo> _fullSongs = new List<SongInfo>();
+
+        /// <summary>已注入进游戏播放列表的窗口数量（BuildItems/扩窗的记账值）。</summary>
+        private static int _injectedCount;
+
+        /// <summary>每次扩窗追加的曲目数。</summary>
+        private const int ExtendChunk = 500;
+
+        /// <summary>已注入窗口内的曲目数（对外只读）。</summary>
+        public static int InjectedCount => _injectedCount;
+
         /// <summary>记录最近播放索引（在 PlayMusicInPlaylist 补丁里调用）。</summary>
         public static void NotePlayed(int index) => LastPlayedIndex = index;
+
+        /// <summary>注入窗口上限（BepInEx 配置；0 = 不限制）。初始注入受它约束，用户显式点播时扩窗可越过。</summary>
+        private static int WindowLimit => Math.Max(0, Plugin.MaxInjectedSongs?.Value ?? 1000);
 
         /// <summary>Fisher-Yates 原地打乱（随机播放列表用）。</summary>
         public static void ShuffleList<T>(List<T> list)
@@ -50,6 +72,35 @@ namespace ChillNetease.Plugin
                 int j = rng.Next(i + 1);
                 (list[i], list[j]) = (list[j], list[i]);
             }
+        }
+
+        /// <summary>统计游戏播放列表中的网易云曲目数（窗口记账用，切歌时调用一次，开销可忽略）。</summary>
+        private static int CountNetease(System.Collections.Generic.IList<GameAudioInfo> list)
+        {
+            int n = 0;
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (IsNetease(list[i])) n++;
+            }
+            return n;
+        }
+
+        /// <summary>把 _fullSongs[from, to) 构造成元数据曲目对象（AudioClip 为空，播放时按需加载）。</summary>
+        private static List<GameAudioInfo> BuildItems(int from, int to)
+        {
+            var items = new List<GameAudioInfo>(Math.Max(0, to - from));
+            for (int i = from; i < to && i < _fullSongs.Count; i++)
+            {
+                var s = _fullSongs[i];
+                var audio = GameAudioInfo.CreateNormal(
+                    null, AudioTag.Other,
+                    s.Name, s.ArtistName,
+                    "netease_" + s.Id, true, null, null);
+                UuidSongCache["netease_" + s.Id] = s;
+                UuidAudioMap["netease_" + s.Id] = audio;
+                items.Add(audio);
+            }
+            return items;
         }
 
         /// <summary>
@@ -70,26 +121,36 @@ namespace ChillNetease.Plugin
                 bool shuffle = false;
                 try { shuffle = Traverse.Create(service).Property("IsShuffle").GetValue<bool>(); } catch { }
 
+                int windowCount = CountNetease(list);
+
                 int target;
-                if (shuffle && list.Count > 1)
+                if (shuffle && _fullSongs.Count > 0)
                 {
-                    var playing = service.PlayingMusic;
+                    // 随机模式直接在全量歌单中随机（不只是已注入的窗口），选中未注入的歌先扩窗
                     var rng = new Random();
-                    var candidates = new List<int>();
-                    for (int i = 0; i < list.Count; i++)
+                    var playing = service.PlayingMusic;
+                    int playingFull = -1;
+                    if (playing != null && IsNetease(playing) &&
+                        long.TryParse(playing.UUID.Substring(8), out var playingId))
                     {
-                        if (!ReferenceEquals(list[i], playing) &&
-                            !(playing != null && list[i].UUID != null && list[i].UUID == playing.UUID))
+                        for (int i = 0; i < _fullSongs.Count; i++)
                         {
-                            candidates.Add(i);
+                            if (_fullSongs[i].Id == playingId) { playingFull = i; break; }
                         }
                     }
-                    if (candidates.Count == 0)
+                    int pick;
+                    int guard = 0;
+                    do
                     {
-                        for (int i = 0; i < list.Count; i++) candidates.Add(i);
+                        pick = rng.Next(_fullSongs.Count);
+                        guard++;
+                    } while (pick == playingFull && _fullSongs.Count > 1 && guard < 30);
+
+                    if (pick >= windowCount && !TryExtendWindow(pick + 1))
+                    {
+                        pick = Math.Min(pick, Math.Max(0, windowCount - 1)); // 扩窗失败 → 从现有窗口随机
                     }
-                    target = candidates[rng.Next(candidates.Count)];
-                    Plugin.LogInfo($"[Netease] 随机切歌: 从 {list.Count} 首中选 #{target}");
+                    target = pick;
                 }
                 else
                 {
@@ -111,13 +172,24 @@ namespace ChillNetease.Plugin
 
                     if (cur < 0)
                     {
-                        target = direction > 0 ? 0 : list.Count - 1;
+                        target = direction > 0 ? 0 : windowCount - 1;
                     }
                     else
                     {
-                        target = (cur + direction + list.Count) % list.Count;
+                        int desired = cur + direction;
+                        if (desired >= windowCount && windowCount < _fullSongs.Count)
+                        {
+                            // 顺序播放接近窗口末尾 → 自动扩窗（一首首续上完整歌单）
+                            TryExtendWindow(desired + 1);
+                            list = service.CurrentPlayList;
+                        }
+                        if (desired >= list.Count) desired = 0;   // 完整歌单尽头 → 回到开头
+                        if (desired < 0) desired = list.Count - 1;
+                        target = desired;
                     }
                 }
+
+                if (target < 0 || target >= list.Count) return true;
 
                 var audio = list[target];
                 if (IsNetease(audio))
@@ -148,7 +220,10 @@ namespace ChillNetease.Plugin
         public static bool IsNetease(GameAudioInfo a)
             => a != null && a.UUID != null && a.UUID.StartsWith("netease_", StringComparison.Ordinal);
 
-        /// <summary>把歌单注入游戏原生播放列表并播放指定歌（由 F6 面板调用）。</summary>
+        /// <summary>
+        /// 把歌单注入游戏原生播放列表并播放指定歌（由 F6 面板调用）。
+        /// playIndex &lt; 0 = 只注入不播放（启动时恢复上次歌单用）。
+        /// </summary>
         public static void InjectPlaylist(List<SongInfo> songs, int playIndex)
         {
             var service = MusicServicePatches.CurrentInstance;
@@ -160,26 +235,28 @@ namespace ChillNetease.Plugin
 
             try
             {
+                _fullSongs = songs != null ? new List<SongInfo>(songs) : new List<SongInfo>();
                 UuidSongCache.Clear();
                 UuidAudioMap.Clear();
-                var items = new List<GameAudioInfo>(songs.Count);
-                foreach (var s in songs)
+
+                // 注入窗口：默认受 MaxInjectedSongs 约束；指定了播放位置时必须覆盖到它
+                int window = _fullSongs.Count;
+                int limit = WindowLimit;
+                if (limit > 0) window = Math.Min(window, limit);
+                if (playIndex >= 0 && playIndex >= window)
                 {
-                    // 元数据对象：AudioClip 为 null，播放时按需加载（见播放入口补丁）
-                    var audio = GameAudioInfo.CreateNormal(
-                        null, AudioTag.Other,
-                        s.Name, s.ArtistName,
-                        "netease_" + s.Id, true, null, null);
-                    UuidSongCache["netease_" + s.Id] = s;
-                    UuidAudioMap["netease_" + s.Id] = audio;
-                    items.Add(audio);
+                    window = Math.Min(_fullSongs.Count, playIndex + 1 + ExtendChunk);
                 }
 
-                // 清空并填充（可观察列表 → 游戏选歌列表 UI 自动刷新）
+                var items = BuildItems(0, window);
+                _injectedCount = window;
+
+                // 单次 AddRange 填充（游戏原生标签筛选重建也是这个路径），
+                // 避免 Clear+逐首 Add 对大歌单产生数千次集合变更事件
                 service.CurrentPlayList.Clear();
-                foreach (var a in items)
+                if (items.Count > 0)
                 {
-                    service.CurrentPlayList.Add(a);
+                    service.CurrentPlayList.AddRange(items);
                 }
 
                 // 同步随机播放列表（shuffle 模式下切歌从它取）
@@ -207,7 +284,7 @@ namespace ChillNetease.Plugin
                     Plugin.LogWarn("[Netease] 触发 UI 刷新事件失败（可忽略）: " + ex.Message);
                 }
 
-                Plugin.LogInfo($"[Netease] 歌单已注入游戏播放列表: {songs.Count} 首，播放 #{playIndex}");
+                Plugin.LogInfo($"[Netease] 歌单已注入游戏播放列表: 窗口 {items.Count}/{_fullSongs.Count} 首，播放 #{playIndex}");
 
                 if (playIndex >= 0 && playIndex < items.Count)
                 {
@@ -218,6 +295,49 @@ namespace ChillNetease.Plugin
             catch (Exception ex)
             {
                 Plugin.LogWarn("[Netease] 歌单注入失败: " + ex);
+            }
+        }
+
+        /// <summary>
+        /// 扩窗：把 _fullSongs 里的后续曲目追加进游戏播放列表（单次 AddRange）。
+        /// 播放/切歌接近窗口末尾时调用；追加数 = max(需要量, ExtendChunk)。
+        /// </summary>
+        public static bool TryExtendWindow(int minCount)
+        {
+            if (_fullSongs.Count == 0) return false;
+            var service = MusicServicePatches.CurrentInstance;
+            if (service == null || service.CurrentPlayList == null) return false;
+
+            try
+            {
+                int from = CountNetease(service.CurrentPlayList);
+                if (from >= _fullSongs.Count)
+                {
+                    _injectedCount = from;
+                    return false; // 全量已注入
+                }
+                int to = Math.Max(Math.Max(minCount, from + 1), Math.Min(from + ExtendChunk, _fullSongs.Count));
+                to = Math.Min(to, _fullSongs.Count);
+                if (to <= from) return false;
+
+                var items = BuildItems(from, to);
+                _injectedCount = to;
+                service.CurrentPlayList.AddRange(items);
+                try
+                {
+                    var shuffleList = Traverse.Create(service)
+                        .Field("shuffleList").GetValue<List<GameAudioInfo>>();
+                    shuffleList?.AddRange(items);
+                }
+                catch { }
+
+                Plugin.LogInfo($"[Netease] 播放列表扩窗: {to}/{_fullSongs.Count} 首");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogWarn("[Netease] 扩窗失败: " + ex.Message);
+                return false;
             }
         }
 

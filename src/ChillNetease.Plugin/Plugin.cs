@@ -20,7 +20,7 @@ namespace ChillNetease.Plugin
     {
         public const string PluginGuid = "com.haikisha.chillnetease";
         public const string PluginName = "Chill Netease";
-        public const string PluginVersion = "0.2.1";
+        public const string PluginVersion = "0.3.0";
 
         public static ManualLogSource StaticLogger;
 
@@ -35,6 +35,12 @@ namespace ChillNetease.Plugin
 
         /// <summary>无限歌曲：绕过游戏原生 MusicService 的 100 首导入上限。</summary>
         public static BepInEx.Configuration.ConfigEntry<bool> EnableUnlimitedSongs;
+
+        /// <summary>
+        /// 注入游戏播放列表的窗口上限（大歌单保护）。播放/切歌接近窗口末尾时自动扩窗；
+        /// 面板里始终能浏览/点播全部歌曲。0 = 不限制。
+        /// </summary>
+        public static BepInEx.Configuration.ConfigEntry<int> MaxInjectedSongs;
 
         /// <summary>
         /// 登录后初始化：读用户信息 + 预加载歌单（登录成功/插件启动共用）。
@@ -83,7 +89,13 @@ namespace ChillNetease.Plugin
             StaticLogger = Logger;
             EnableUnlimitedSongs = Config.Bind("General", "EnableUnlimitedSongs", true,
                 "绕过游戏原生 100 首音乐导入上限（网易云歌曲导入需要）");
+            MaxInjectedSongs = Config.Bind("Performance", "MaxInjectedSongs", 1000,
+                "注入游戏播放列表的最大曲目数（大歌单防卡顿）。" +
+                "播放/切歌接近窗口末尾会自动追加后续歌曲，随机模式在全量歌单中随机。0 = 不限制");
             Logger.LogInfo($"{PluginName} {PluginVersion} loaded");
+
+            // 0. 加载本地导入歌单存档（重启保留，稍后由 NeteaseUi 在 MusicService 就绪后恢复注入）
+            PlaylistStore.Load();
 
             // 1. 初始化网易云桥接（ChillNetease.dll 与插件同目录）
             var pluginDir = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);

@@ -201,6 +201,15 @@ namespace ChillNetease.Plugin
             catch { return null; }
         }
 
+        /// <summary>歌单详情（导入链接时取歌单名等；失败返回 null，调用方自行兜底）。</summary>
+        public PlaylistDetail GetPlaylistDetail(long playlistId)
+        {
+            var json = TakeString(NeteaseGetPlaylistDetail(playlistId));
+            if (json == null) return null;
+            try { return JsonConvert.DeserializeObject<PlaylistDetail>(json); }
+            catch { return null; }
+        }
+
         /// <summary>全站搜索单曲（go-musicfox SearchService，Type=1）。</summary>
         public List<SongInfo> SearchSongs(string keyword, int limit = 30)
         {
