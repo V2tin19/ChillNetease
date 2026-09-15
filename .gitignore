@@ -12,3 +12,9 @@ obj/
 
 # Release staging
 .release/
+
+# 只留在本地工作区，不进发布仓库
+CHILL_GAME_PLUGIN_GUIDE.md
+
+# WorkBuddy 项目数据（memory 等）
+.workbuddy/
